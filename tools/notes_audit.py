@@ -19,6 +19,7 @@ import collections
 import datetime
 import json
 import os
+import re
 import statistics
 import sys
 import tempfile
@@ -92,6 +93,57 @@ def split_by(rows, cuts):
                 idx = i + 1
         buckets[labels[idx]].append(r)
     return list(buckets.items())
+
+
+IDLE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \S+ idle (\d+)s: (.+)$')
+STATIC_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\S* .*static diff=([0-9.]+)')
+
+
+def _ts(s):
+    return datetime.datetime.strptime(s, '%Y-%m-%d %H:%M:%S').timestamp()
+
+
+def load_capture(path):
+    """解析捕获端日志（pc_body.log）：idle 状态跃迁 + static 帧差静默标记。
+
+    ⚠️ 只取"状态/时刻"，**不取窗口标题**——归因需要的是"当时捕获端认为要不要说话"，
+    不是她看了什么（对账报告不该带私人内容）。
+    """
+    idle, static = [], []
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            m = IDLE_RE.match(line)
+            if m:
+                idle.append((_ts(m.group(1)), m.group(3).strip()))
+                continue
+            m = STATIC_RE.match(line)
+            if m:
+                static.append(_ts(m.group(1)))
+    return idle, static
+
+
+def state_at(idle, ts):
+    """取 <= ts 的最后一个 idle 状态；没有就返回 ''。"""
+    cur = ''
+    for t, st in idle:
+        if t > ts:
+            break
+        cur = st
+    return cur
+
+
+def attribute(gap_start, gap_end, idle, static):
+    """把一段静默归因到捕获端状态。只有前两类和 static 标记算"有证据"。"""
+    st = state_at(idle, gap_start)
+    if not idle:
+        return '未知(无捕获端日志)', st
+    if '暂停' in st:
+        return 'pause(证据)', st
+    if 'slow' in st:
+        return 'slow(证据)', st
+    if any(gap_start - 120 <= s <= gap_end for s in static):
+        return 'static(证据)', st
+    return 'normal(无证据)', st
 
 
 def dup_groups(rows, n=12):
@@ -214,6 +266,8 @@ def main(argv=None):
     ap.add_argument('files', nargs='*', help='notes jsonl（可多个）')
     ap.add_argument('--split', default='', help='按本地时刻切段，如 12:41,13:57')
     ap.add_argument('--date', default='', help='只保留这一天（本地时区 YYYY-MM-DD）')
+    ap.add_argument('--capture-log', default='',
+                    help='捕获端日志（pc_body.log）：用 idle/static 状态给每段静默做归因')
     ap.add_argument('--gaps', type=int, default=0,
                     help='报告超过 N 秒的静默空档（用来核对"没说话"是否都有捕获端 idle 解释）')
     ap.add_argument('--hours', type=float, default=0,
@@ -255,10 +309,21 @@ def main(argv=None):
                 gaps.append((prev, r['ts'], r['ts'] - prev))
         if not gaps:
             print('  无（≥%ds 的空档一个都没有）' % a.gaps)
+        idle, static = load_capture(a.capture_log) if a.capture_log else ([], [])
+        tally = collections.Counter()
         for a_ts, b_ts, dt in gaps:
-            print('  %s → %s  %d 分 %02ds' % (local(a_ts).strftime('%m-%d %H:%M:%S'),
-                                             local(b_ts).strftime('%m-%d %H:%M:%S'), dt // 60, dt % 60))
+            verdict, st = attribute(a_ts, b_ts, idle, static) if a.capture_log else ('(未提供捕获端日志)', '')
+            tally[verdict] += 1
+            print('  %s → %s  %d 分 %02ds  %s%s' % (
+                local(a_ts).strftime('%m-%d %H:%M:%S'), local(b_ts).strftime('%m-%d %H:%M:%S'),
+                dt // 60, dt % 60, verdict, ('  [当时=%s]' % st[:12]) if st else ''))
         print('  合计 %d 段，静默总时长 %d 分钟' % (len(gaps), sum(g[2] for g in gaps) // 60))
+        if a.capture_log:
+            print('  归因：%s' % dict(tally))
+            if tally.get('normal(无证据)'):
+                print('  ⚠️ %d 段静默起于 normal 且没有 static 标记 = **无法正面归因**'
+                      '（画面静止抑制需 pc_body 记 static 日志，见 docs 对账报告 §2）'
+                      % tally['normal(无证据)'])
 
     bad = [(lab, b) for lab, r in results for b in (r.get('bad') or [])]
     print('\n--- 汇总 ---')

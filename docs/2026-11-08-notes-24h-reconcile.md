@@ -55,6 +55,9 @@ python tools/notes_audit.py ~/pc-body/notes.jsonl --hours 24 \
 | 8 | 11-08 12:36:46 → 12:57:57 | 21m10 | `slow` → 12:41:53 `暂停推送` | **正面证据** |
 | 9 | 11-08 13:49:39 → 19:08:19 | 318m39 | `normal` → 14:08 slow → 14:38 pause → 15:00 slow → 15:30 pause | 以 `暂停推送` 为主 |
 
+> 上表不再靠手抄：`--capture-log /tmp/capture_events.log`（从 pc_body.log 抽 `idle`/`static` 行，**不含窗口标题**）
+> 会自动给每段空档打归因并汇总。实测复现同一结论：`{'slow(证据)': 4, 'normal(无证据)': 5}`。
+
 **4 段有正面证据（slow / 暂停推送），5 段只能"相容"而不能"证明"**：
 
 捕获端除了 idle 降频，还有一条**帧差闸**——`pc_body.py:195 DIFF_THRESHOLD = 0.02`，
