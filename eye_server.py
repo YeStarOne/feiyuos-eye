@@ -118,6 +118,82 @@ for _s in ('mc', 'stardew'):
 del _s
 
 
+# ── 派生标量：服务端看得见"她多久没看见东西了"（2026-11-08，只读，不改任何行为） ──
+# 契约：code/wait/CONTRACT-eye-mount.md §3。last_note_age_s **永远是 int**——
+# 当天没有笔记时 = 距当天 00:00 的秒数。返回 null 会让 `last_note_age_s < 60` 变成 type_error，
+# 于是她的等待条件在"真正满足"时安静走到 timeout（与 MC 侧 day>=1 拿到 missing 同一个坑）。
+ROTATED_NOTES_RE = re.compile(r'^notes-\d{8}-\d{4}\.jsonl$')
+_NOTES_STATS_CACHE = {}
+
+
+def _cst_date(ts):
+    return time.strftime('%Y-%m-%d', time.gmtime(ts + 8 * 3600))
+
+
+def _since_midnight(ts):
+    """距北京时间当天 00:00 的秒数（CST 无夏令时，直接用偏移算，不依赖 tz 库）。"""
+    st = time.gmtime(ts + 8 * 3600)
+    return st.tm_hour * 3600 + st.tm_min * 60 + st.tm_sec
+
+
+def _notes_files(scene):
+    files = [scene_notes_file(scene)]
+    if scene == 'pet':
+        # pet 的 notes 会轮转（>3MB 改名 notes-YYYYMMDD-HHMM.jsonl），当天的行可能已经滚走了
+        try:
+            files += sorted(p for p in DATA_DIR.glob('notes-*.jsonl') if ROTATED_NOTES_RE.match(p.name))
+        except OSError:
+            pass
+    return files
+
+
+def notes_stats(scene='pet', now=None):
+    """(最后一行的 ts, 当天行数, 最近 1 小时行数)。按 (mtime,size) 缓存，不每次全量解析。"""
+    nowts = time.time() if now is None else now
+    files = [f for f in _notes_files(scene) if f.exists()]
+    sig = tuple((str(f), f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+    key = (scene, _cst_date(nowts), sig)
+    hit = _NOTES_STATS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    last_ts, today, hour = None, 0, 0
+    today_str = _cst_date(nowts)
+    for f in files:
+        try:
+            with open(f, encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ts = json.loads(line).get('ts')
+                    except Exception:
+                        continue
+                    if not isinstance(ts, (int, float)):
+                        continue
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+                    if _cst_date(ts) == today_str:
+                        today += 1
+                        if nowts - ts <= 3600:
+                            hour += 1
+        except OSError:
+            continue
+    out = (last_ts, today, hour)
+    _NOTES_STATS_CACHE.clear()          # 只留最新一次，防缓存无界
+    _NOTES_STATS_CACHE[key] = out
+    return out
+
+
+def note_age_s(scene='pet', now=None):
+    """距最近一条笔记的秒数；当天没有笔记 = 距当天 00:00 的秒数（永远是 int）。"""
+    nowts = time.time() if now is None else now
+    last_ts, _, _ = notes_stats(scene, nowts)
+    if last_ts is None or _cst_date(last_ts) != _cst_date(nowts):
+        return int(_since_midnight(nowts))
+    return max(0, int(nowts - last_ts))
+
+
 def scene_summary():
     """给 /health 用：每场景一行，含"是否启用"（= token 文件在不在）。"""
     out = {}
@@ -128,7 +204,11 @@ def scene_summary():
                   'day_bytes': st['day_bytes'], 'day_calls': st['day_calls'],
                   'day_tokens': st['day_tokens'],
                   'day_call_cap': SCENE_DAY_CALLS.get(s),
-                  'min_interval_s': SCENE_MIN_INTERVAL.get(s)}
+                  'min_interval_s': SCENE_MIN_INTERVAL.get(s),
+                  # 只读派生标量（/wait 的 path 集就从这里来）：看不见"多久没说话"= 无法区分
+                  # "没人用电脑"和"眼睛瞎了"
+                  'last_note_age_s': note_age_s(s),
+                  'notes_today': notes_stats(s)[1]}
     return out
 # 日计数落盘：eye-server 重启不该把当日 clip/日闸计数清零（否则"闸耗尽"状态会撒谎）
 DAY_STATE_FILE = DATA_DIR / 'day-state.json'
@@ -595,6 +675,9 @@ class H(BaseHTTPRequestHandler):
                                    'force_go': FORCE_GO_PATH.exists(),
                                    'pool_probe': STATE['pool_probe'],
                                    'pool_ok_streak': STATE['pool_ok_streak'],
+                                   'last_note_age_s': note_age_s('pet'),
+                                   'notes_today': notes_stats('pet')[1],
+                                   'notes_last_hour': notes_stats('pet')[2],
                                    'scenes': scene_summary()})
         if path == '/notes':
             try:

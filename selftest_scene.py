@@ -308,6 +308,58 @@ def main():
         check('note_hist 可测（recent_similar/STATE 必须存在，不许静默跳过）', False,
               'recent_similar=%s STATE=%s' % (hasattr(S, 'recent_similar'), hasattr(S, 'STATE')))
 
+    # ── 19. /health 只读派生标量（服务端能看见"她多久没看见东西了"）
+    #  2026-11-08：契约 eye-mount §3。last_note_age_s 必须是 int——null 会让
+    #  `last_note_age_s < 60` 变 type_error，条件在"真正满足"时安静走到 timeout。
+    import time as _t
+    now = _t.time()
+    code, d = http(port, 'GET', '/health', None, PET)
+    need = ('last_note_age_s', 'notes_today', 'notes_last_hour')
+    check('/health 有派生标量且都是 int',
+          code == 200 and all(isinstance((d or {}).get(k), int) for k in need),
+          repr({k: (d or {}).get(k) for k in need}))
+    sc = ((d or {}).get('scenes') or {}).get('pet') or {}
+    check('scenes.pet 也带 last_note_age_s/notes_today',
+          isinstance(sc.get('last_note_age_s'), int) and isinstance(sc.get('notes_today'), int),
+          repr({k: sc.get(k) for k in ('last_note_age_s', 'notes_today')}))
+
+    helpers = ('note_age_s', 'notes_stats', '_since_midnight')
+    if all(hasattr(S, n) for n in helpers):
+        probe = os.path.join(data, 'notes-probe.jsonl')
+
+        # 语义①：完全没有笔记 → 距当天 00:00 的秒数（int，绝不是 null）
+        open(probe, 'w', encoding='utf-8').close()
+        empty_age = S.note_age_s('probe')
+        check('无笔记 → age = 距当天 00:00 的秒数（int）',
+              isinstance(empty_age, int) and empty_age == int(S._since_midnight(_t.time())),
+              repr((empty_age, S._since_midnight(_t.time()))))
+
+        # 语义②：昨天有笔记不算"今天说过" → 回落距零点，不是 24h+
+        with open(probe, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'ts': now - 86400, 'note': '昨天那句', 'kind': 'frames'}) + chr(10))
+        old_age = S.note_age_s('probe')
+        check('昨天有笔记 → age 仍按距零点算（不是 24h+）',
+              0 <= old_age < 86400 and old_age == int(S._since_midnight(_t.time())), repr(old_age))
+
+        # 语义③：刚写过 → age 小，且**缓存必须随文件变化失效**（否则监控看到旧数）
+        with open(probe, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'ts': now - 7, 'note': '刚看过', 'kind': 'frames'}) + chr(10))
+        fresh_age = S.note_age_s('probe')
+        check('刚写完 → age≈7s（缓存随 mtime 失效）', 5 <= fresh_age <= 20, repr(fresh_age))
+
+        # 计数：今天 2 行 + 昨天 1 行
+        with open(probe, 'w', encoding='utf-8') as f:
+            for ts in (now - 7, now - 30, now - 86400):
+                f.write(json.dumps({'ts': ts, 'note': 'x', 'kind': 'frames'}) + chr(10))
+        last_ts, today_n, hour_n = S.notes_stats('probe')
+        check('notes_today 只数今天（2 行）', today_n == 2, repr(today_n))
+        check('notes_last_hour 只数最近 1 小时（2 行）', hour_n == 2, repr(hour_n))
+        check('last ts 取最大', int(last_ts) == int(now - 7), repr((last_ts, now - 7)))
+    else:
+        # 对照必须"红在断言上"，不能"崩在缺属性"
+        for n in helpers:
+            check('派生标量 helper 存在：%s' % n, False, '旧实现没有它')
+
     # ── 18. notes 行口径：native 录屏 frames=0 是正常的，靠 mode 区分（不是漏字段）
     S.write_note('测试句', {'window': 'w-clip', 'frame_count': 0, 'mode': 'native'}, 'go', 7)
     last = rows(os.path.join(data, 'notes.jsonl'))[-1]
