@@ -102,6 +102,9 @@ STATE = {
     'note_hist': [],          # [(ts, window)] 近期已写笔记（节流 + 去重用）
     'pool_ok_streak': 0,      # P5 池探测连击
     'pool_probe': None,       # {'ts', 'ok', 'detail'}
+    # 捕获端自报状态（2026-11-08）：{'state','idle_s','static_skips','last_static_age_s','ts'}
+    # 没有它，服务端只能看到"没东西"，分不清「没人用电脑 / 画面没动 / 眼睛瞎了」
+    'capture': None,
 }
 LOCK = threading.Lock()
 
@@ -116,6 +119,48 @@ PART = {'pet': STATE}
 for _s in ('mc', 'stardew'):
     PART[_s] = _new_part()
 del _s
+
+
+CAPTURE_STATES = ('normal', 'slow', 'paused')
+
+
+def _cap_int(meta, key, lo, hi):
+    """宽松取整数：非整数/缺省一律 None（宁可不报，也不写一个假状态）。"""
+    try:
+        v = int(meta.get(key))
+    except (TypeError, ValueError):
+        return None
+    return max(lo, min(hi, v))
+
+
+def capture_report(meta, now=None):
+    """把 /frames 里的捕获端自报字段解析成可展示状态；形状不对就整条丢弃。
+
+    这是**展示用**状态，不参与任何闸判定——客户端送什么都不改变限流/暂停/额度。
+    """
+    state = str(meta.get('capture_state') or '').strip().lower()
+    if state not in CAPTURE_STATES:
+        return None
+    idle = _cap_int(meta, 'capture_idle_s', 0, 7 * 86400)
+    skips = _cap_int(meta, 'capture_static_skips', 0, 100000)
+    sage = _cap_int(meta, 'capture_last_static_age_s', -1, 7 * 86400)
+    if idle is None or skips is None or sage is None:
+        return None
+    return {'state': state, 'idle_s': idle, 'static_skips': skips,
+            'last_static_age_s': sage, 'ts': time.time() if now is None else now}
+
+
+def capture_view():
+    """/health 用：平铺 + 一个 age，方便一眼看出"这条状态是不是陈的"。"""
+    cap = STATE.get('capture')
+    if not cap:
+        return {'capture_state': None, 'capture_idle_s': None,
+                'capture_static_skips': None, 'capture_last_static_age_s': None,
+                'capture_age_s': None}
+    return {'capture_state': cap['state'], 'capture_idle_s': cap['idle_s'],
+            'capture_static_skips': cap['static_skips'],
+            'capture_last_static_age_s': cap['last_static_age_s'],
+            'capture_age_s': max(0, int(time.time() - cap['ts']))}
 
 
 # ── 派生标量：服务端看得见"她多久没看见东西了"（2026-11-08，只读，不改任何行为） ──
@@ -678,6 +723,7 @@ class H(BaseHTTPRequestHandler):
                                    'last_note_age_s': note_age_s('pet'),
                                    'notes_today': notes_stats('pet')[1],
                                    'notes_last_hour': notes_stats('pet')[2],
+                                   **capture_view(),
                                    'scenes': scene_summary()})
         if path == '/notes':
             try:
@@ -711,6 +757,30 @@ class H(BaseHTTPRequestHandler):
                 return self._json({'ok': False, 'error': 'scene-disabled', 'scene': scene}, 401)
             return self._json({'ok': False, 'error': 'unauthorized', 'scene': scene}, 401)
         path = self.path.split('?')[0]
+        if path == '/capture':
+            # 捕获端状态回传（2026-11-08）：**只报状态，不调模型、不扣额度、不受暂停闸影响**。
+            # 必须能穿透暂停：paused 恰恰是"永远不推 /frames"的那个状态，夹带在帧里永远学不到。
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+            except ValueError:
+                return self._json({'ok': False, 'error': 'bad-length'}, 400)
+            if length <= 0 or length > 8192:
+                return self._json({'ok': False, 'error': 'bad-length'}, 400)
+            try:
+                payload = json.loads(self.rfile.read(length).decode('utf-8'))
+            except Exception as e:
+                return self._json({'ok': False, 'error': 'bad-json: %s' % e}, 400)
+            meta = payload.get('meta') if isinstance(payload.get('meta'), dict) else payload
+            cap = capture_report(meta or {})
+            if not cap:
+                return self._json({'ok': False, 'error': 'bad-capture', 'need':
+                                   ['capture_state(normal|slow|paused)', 'capture_idle_s(int)',
+                                    'capture_static_skips(int)', 'capture_last_static_age_s(int)']}, 400)
+            with LOCK:
+                STATE['capture'] = cap
+            ledger('capture_report', state=cap['state'], idle_s=cap['idle_s'],
+                   static_skips=cap['static_skips'])
+            return self._json({'ok': True, 'capture': capture_view()})
         if path in ('/pause', '/resume'):
             q = self.path.split('scene=')[1].split('&')[0].lower() if 'scene=' in self.path else scene
             if q not in SCENES:
@@ -894,6 +964,10 @@ class H(BaseHTTPRequestHandler):
         if not frames or not isinstance(frames, list):
             return self._json({'error': 'no-frames'}, 400)
         meta = payload.get('meta', {})
+        cap = capture_report(meta)
+        if cap:
+            with LOCK:
+                STATE['capture'] = cap
         wkey = win_key(meta)                  # 空窗口退到进程名，别把不相关的观察并成一个桶
         app_type = (meta.get('app_type') or 'other').lower()
         prompt = {'game': PROMPT_PLAY, 'video': PROMPT_VIDEO}.get(app_type, PROMPT_COMPANION)

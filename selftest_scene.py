@@ -360,6 +360,97 @@ def main():
         for n in helpers:
             check('派生标量 helper 存在：%s' % n, False, '旧实现没有它')
 
+    # ── 20. 捕获端自报状态：/frames 带 capture_* → /health 看得见（只展示，不参与闸）
+    #  对照要红在这些断言上，不能红在"缺属性"——所以缺 helper 只记一条红，其余照跑。
+    if not hasattr(S, 'capture_report'):
+        check('capture_report 存在（旧实现没有它）', False, 'helper 缺失')
+
+    def health():
+        c, dd = http(port, 'GET', '/health', None, PET)
+        return c, (dd or {})
+
+    def post_meta(meta):
+        m = {'app_type': 'game', 'window': 'w-cap'}
+        m.update(meta)
+        return http(port, 'POST', '/frames', {'frames': FR, 'meta': m}, PET)
+
+    code, _ = post_meta({'capture_state': 'slow', 'capture_idle_s': 2700,
+                         'capture_static_skips': 3, 'capture_last_static_age_s': 42})
+    _, h = health()
+    check('capture 状态落到 /health',
+          code == 200 and h.get('capture_state') == 'slow' and h.get('capture_idle_s') == 2700
+          and h.get('capture_static_skips') == 3 and h.get('capture_last_static_age_s') == 42,
+          repr({k: h.get(k) for k in ('capture_state', 'capture_idle_s',
+                                      'capture_static_skips', 'capture_last_static_age_s')}))
+    check('capture_age_s 是 int 且很小',
+          isinstance(h.get('capture_age_s'), int) and 0 <= h['capture_age_s'] <= 5,
+          repr(h.get('capture_age_s')))
+
+    # 拼错的状态名不许覆盖已有状态（宁可留旧值，也不写一个假状态）
+    post_meta({'capture_state': 'pausedd', 'capture_idle_s': 1,
+               'capture_static_skips': 0, 'capture_last_static_age_s': 0})
+    _, h2 = health()
+    check('非法 capture_state 不覆盖', h2.get('capture_state') == 'slow',
+          repr(h2.get('capture_state')))
+
+    # 类型不对整条丢弃（不半信半疑地写进去）
+    post_meta({'capture_state': 'paused', 'capture_idle_s': 'abc',
+               'capture_static_skips': 0, 'capture_last_static_age_s': 0})
+    _, h3 = health()
+    check('非整数 idle → 整条丢弃（保持 slow）', h3.get('capture_state') == 'slow',
+          repr(h3.get('capture_state')))
+
+    # 正常更新一次（paused + 大 idle）
+    post_meta({'capture_state': 'paused', 'capture_idle_s': 2800,
+               'capture_static_skips': 0, 'capture_last_static_age_s': 600})
+    _, h4 = health()
+    check('新状态正常覆盖', h4.get('capture_state') == 'paused' and h4.get('capture_idle_s') == 2800,
+          repr((h4.get('capture_state'), h4.get('capture_idle_s'))))
+
+    # 不带字段的老客户端 → 状态保持不变（不能因为"没报"就清空）
+    post_meta({})
+    _, h5 = health()
+    check('老客户端不报 → 状态保持（不清空）', h5.get('capture_state') == 'paused',
+          repr(h5.get('capture_state')))
+
+    # ── 21. POST /capture：只报状态，不调模型、不扣额度、**必须能穿透暂停闸**
+    #  paused 恰恰是"永远不推 /frames"的状态；夹在帧里永远学不到它，所以单独一条路。
+    cap_body = {'capture_state': 'paused', 'capture_idle_s': 3719,
+                'capture_static_skips': 0, 'capture_last_static_age_s': 900}
+    code, d = http(port, 'POST', '/capture', cap_body, PET)
+    check('/capture 收到状态 → 200', code == 200 and (d or {}).get('ok') is True, repr((code, d)))
+    _, h = health()
+    check('/capture 的状态进了 /health',
+          h.get('capture_state') == 'paused' and h.get('capture_idle_s') == 3719,
+          repr((h.get('capture_state'), h.get('capture_idle_s'))))
+
+    # 关键：暂停中也要能收到（否则"她为什么静默"永远报不上来）
+    if hasattr(S, 'STATE'):
+        S.STATE['paused'] = True
+        S.STATE['pause_reason'] = 'selftest'
+    code, d = http(port, 'POST', '/capture',
+                   dict(cap_body, capture_state='slow', capture_idle_s=1800), PET)
+    check('/capture 穿透暂停闸（暂停中仍 200）', code == 200 and (d or {}).get('ok') is True,
+          repr((code, d)))
+    if hasattr(S, 'STATE'):
+        S.STATE['paused'] = False
+        S.STATE['pause_reason'] = ''
+
+    # 形状不对 → 400，且不许污染已有状态
+    code, d = http(port, 'POST', '/capture', {'capture_state': 'zzz'}, PET)
+    _, h = health()
+    check('/capture 非法形状 → 400 且不污染', code == 400 and h.get('capture_state') == 'slow',
+          repr((code, (d or {}).get('error'), h.get('capture_state'))))
+
+    code, d = http(port, 'POST', '/capture', cap_body,
+                   {'Authorization': 'Bearer wrong-token'})
+    check('/capture 凭据不对 → 401', code == 401, repr(code))
+
+    led = rows(os.path.join(data, 'ledger.jsonl'))
+    check('/capture 在账本留痕',
+          any(r.get('kind') == 'capture_report' for r in led),
+          repr([r.get('kind') for r in led][-4:]))
+
     # ── 18. notes 行口径：native 录屏 frames=0 是正常的，靠 mode 区分（不是漏字段）
     S.write_note('测试句', {'window': 'w-clip', 'frame_count': 0, 'mode': 'native'}, 'go', 7)
     last = rows(os.path.join(data, 'notes.jsonl'))[-1]
