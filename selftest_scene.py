@@ -277,15 +277,196 @@ def main():
     check('ledger: pet 行没有 scene',
           bool(pet_rows) and all('scene' not in r for r in pet_rows), repr(pet_rows[:1]))
 
+    # ── 17. 空 window 不共用「同一个桶」（governor 误劝沉默 / dup 误吞）
+    #  2026-11-08：锁屏/无前台窗/UWP 拿不到标题时 window=''，以前所有这类观察并进同一个桶，
+    #  6 分钟内第 3 条起被劝沉默、相似句还会被判复读。归组键=「窗口名优先，进程名兜底」。
+    wk = getattr(S, 'win_key', None)
+    check('win_key: 有窗口名用窗口名',
+          bool(wk) and wk({'window': '标题A', 'proc': 'a.exe'}) == '标题A', repr(wk and wk({'window': '标题A', 'proc': 'a.exe'})))
+    check('win_key: 空窗口退到进程名',
+          bool(wk) and wk({'window': '  ', 'proc': 'a.exe'}) == 'proc:a.exe', repr(wk and wk({'window': '  ', 'proc': 'a.exe'})))
+    check('win_key: 不同进程不并桶',
+          bool(wk) and wk({'window': '', 'proc': 'a.exe'}) != wk({'window': '', 'proc': 'b.exe'}))
+    check('win_key: 全空返回空串（调用方跳过桶）',
+          bool(wk) and wk({'window': '', 'proc': ''}) == '', repr(wk and wk({'window': '', 'proc': ''})))
+
+    if hasattr(S, 'STATE') and hasattr(S, 'recent_similar'):
+        S.STATE.setdefault('note_hist', []).append(
+            (__import__('time').time(), 'proc:a.exe', '同一句很长很长很长的观察描述内容'))
+        check('同进程的空窗口笔记照常判复读',
+              S.recent_similar('proc:a.exe', '同一句很长很长很长的观察描述内容') is not None)
+        check('不同进程的空窗口笔记不判复读',
+              S.recent_similar('proc:b.exe', '同一句很长很长很长的观察描述内容') is None)
+        # 接线（只测 helper 会假绿）：真 POST 一条空窗口+process 的请求，note_hist 必须记进程键
+        code, d = http(port, 'POST', '/frames',
+                       {'frames': FR, 'meta': {'app_type': 'game', 'window': '',
+                                              'process': 'zz.exe'}}, PET)
+        k = S.STATE['note_hist'][-1][1] if S.STATE.get('note_hist') else None
+        check('空窗口 POST 的 note_hist 记进程键（接线）', code == 200 and k == 'proc:zz.exe',
+              repr((code, k)))
+    else:
+        check('note_hist 可测（recent_similar/STATE 必须存在，不许静默跳过）', False,
+              'recent_similar=%s STATE=%s' % (hasattr(S, 'recent_similar'), hasattr(S, 'STATE')))
+
+    # ── 19. /health 只读派生标量（服务端能看见"她多久没看见东西了"）
+    #  2026-11-08：契约 eye-mount §3。last_note_age_s 必须是 int——null 会让
+    #  `last_note_age_s < 60` 变 type_error，条件在"真正满足"时安静走到 timeout。
+    import time as _t
+    now = _t.time()
+    code, d = http(port, 'GET', '/health', None, PET)
+    need = ('last_note_age_s', 'notes_today', 'notes_last_hour')
+    check('/health 有派生标量且都是 int',
+          code == 200 and all(isinstance((d or {}).get(k), int) for k in need),
+          repr({k: (d or {}).get(k) for k in need}))
+    sc = ((d or {}).get('scenes') or {}).get('pet') or {}
+    check('scenes.pet 也带 last_note_age_s/notes_today',
+          isinstance(sc.get('last_note_age_s'), int) and isinstance(sc.get('notes_today'), int),
+          repr({k: sc.get(k) for k in ('last_note_age_s', 'notes_today')}))
+
+    helpers = ('note_age_s', 'notes_stats', '_since_midnight')
+    if all(hasattr(S, n) for n in helpers):
+        probe = os.path.join(data, 'notes-probe.jsonl')
+
+        # 语义①：完全没有笔记 → 距当天 00:00 的秒数（int，绝不是 null）
+        open(probe, 'w', encoding='utf-8').close()
+        empty_age = S.note_age_s('probe')
+        check('无笔记 → age = 距当天 00:00 的秒数（int）',
+              isinstance(empty_age, int) and empty_age == int(S._since_midnight(_t.time())),
+              repr((empty_age, S._since_midnight(_t.time()))))
+
+        # 语义②：昨天有笔记不算"今天说过" → 回落距零点，不是 24h+
+        with open(probe, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'ts': now - 86400, 'note': '昨天那句', 'kind': 'frames'}) + chr(10))
+        old_age = S.note_age_s('probe')
+        check('昨天有笔记 → age 仍按距零点算（不是 24h+）',
+              0 <= old_age < 86400 and old_age == int(S._since_midnight(_t.time())), repr(old_age))
+
+        # 语义③：刚写过 → age 小，且**缓存必须随文件变化失效**（否则监控看到旧数）
+        with open(probe, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'ts': now - 7, 'note': '刚看过', 'kind': 'frames'}) + chr(10))
+        fresh_age = S.note_age_s('probe')
+        check('刚写完 → age≈7s（缓存随 mtime 失效）', 5 <= fresh_age <= 20, repr(fresh_age))
+
+        # 计数：今天 2 行 + 昨天 1 行
+        with open(probe, 'w', encoding='utf-8') as f:
+            for ts in (now - 7, now - 30, now - 86400):
+                f.write(json.dumps({'ts': ts, 'note': 'x', 'kind': 'frames'}) + chr(10))
+        last_ts, today_n, hour_n = S.notes_stats('probe')
+        check('notes_today 只数今天（2 行）', today_n == 2, repr(today_n))
+        check('notes_last_hour 只数最近 1 小时（2 行）', hour_n == 2, repr(hour_n))
+        check('last ts 取最大', int(last_ts) == int(now - 7), repr((last_ts, now - 7)))
+    else:
+        # 对照必须"红在断言上"，不能"崩在缺属性"
+        for n in helpers:
+            check('派生标量 helper 存在：%s' % n, False, '旧实现没有它')
+
+    # ── 20. 捕获端自报状态：/frames 带 capture_* → /health 看得见（只展示，不参与闸）
+    #  对照要红在这些断言上，不能红在"缺属性"——所以缺 helper 只记一条红，其余照跑。
+    if not hasattr(S, 'capture_report'):
+        check('capture_report 存在（旧实现没有它）', False, 'helper 缺失')
+
+    def health():
+        c, dd = http(port, 'GET', '/health', None, PET)
+        return c, (dd or {})
+
+    def post_meta(meta):
+        m = {'app_type': 'game', 'window': 'w-cap'}
+        m.update(meta)
+        return http(port, 'POST', '/frames', {'frames': FR, 'meta': m}, PET)
+
+    code, _ = post_meta({'capture_state': 'slow', 'capture_idle_s': 2700,
+                         'capture_static_skips': 3, 'capture_last_static_age_s': 42})
+    _, h = health()
+    check('capture 状态落到 /health',
+          code == 200 and h.get('capture_state') == 'slow' and h.get('capture_idle_s') == 2700
+          and h.get('capture_static_skips') == 3 and h.get('capture_last_static_age_s') == 42,
+          repr({k: h.get(k) for k in ('capture_state', 'capture_idle_s',
+                                      'capture_static_skips', 'capture_last_static_age_s')}))
+    check('capture_age_s 是 int 且很小',
+          isinstance(h.get('capture_age_s'), int) and 0 <= h['capture_age_s'] <= 5,
+          repr(h.get('capture_age_s')))
+
+    # 拼错的状态名不许覆盖已有状态（宁可留旧值，也不写一个假状态）
+    post_meta({'capture_state': 'pausedd', 'capture_idle_s': 1,
+               'capture_static_skips': 0, 'capture_last_static_age_s': 0})
+    _, h2 = health()
+    check('非法 capture_state 不覆盖', h2.get('capture_state') == 'slow',
+          repr(h2.get('capture_state')))
+
+    # 类型不对整条丢弃（不半信半疑地写进去）
+    post_meta({'capture_state': 'paused', 'capture_idle_s': 'abc',
+               'capture_static_skips': 0, 'capture_last_static_age_s': 0})
+    _, h3 = health()
+    check('非整数 idle → 整条丢弃（保持 slow）', h3.get('capture_state') == 'slow',
+          repr(h3.get('capture_state')))
+
+    # 正常更新一次（paused + 大 idle）
+    post_meta({'capture_state': 'paused', 'capture_idle_s': 2800,
+               'capture_static_skips': 0, 'capture_last_static_age_s': 600})
+    _, h4 = health()
+    check('新状态正常覆盖', h4.get('capture_state') == 'paused' and h4.get('capture_idle_s') == 2800,
+          repr((h4.get('capture_state'), h4.get('capture_idle_s'))))
+
+    # 不带字段的老客户端 → 状态保持不变（不能因为"没报"就清空）
+    post_meta({})
+    _, h5 = health()
+    check('老客户端不报 → 状态保持（不清空）', h5.get('capture_state') == 'paused',
+          repr(h5.get('capture_state')))
+
+    # ── 21. POST /capture：只报状态，不调模型、不扣额度、**必须能穿透暂停闸**
+    #  paused 恰恰是"永远不推 /frames"的状态；夹在帧里永远学不到它，所以单独一条路。
+    cap_body = {'capture_state': 'paused', 'capture_idle_s': 3719,
+                'capture_static_skips': 0, 'capture_last_static_age_s': 900}
+    code, d = http(port, 'POST', '/capture', cap_body, PET)
+    check('/capture 收到状态 → 200', code == 200 and (d or {}).get('ok') is True, repr((code, d)))
+    _, h = health()
+    check('/capture 的状态进了 /health',
+          h.get('capture_state') == 'paused' and h.get('capture_idle_s') == 3719,
+          repr((h.get('capture_state'), h.get('capture_idle_s'))))
+
+    # 关键：暂停中也要能收到（否则"她为什么静默"永远报不上来）
+    if hasattr(S, 'STATE'):
+        S.STATE['paused'] = True
+        S.STATE['pause_reason'] = 'selftest'
+    code, d = http(port, 'POST', '/capture',
+                   dict(cap_body, capture_state='slow', capture_idle_s=1800), PET)
+    check('/capture 穿透暂停闸（暂停中仍 200）', code == 200 and (d or {}).get('ok') is True,
+          repr((code, d)))
+    if hasattr(S, 'STATE'):
+        S.STATE['paused'] = False
+        S.STATE['pause_reason'] = ''
+
+    # 形状不对 → 400，且不许污染已有状态
+    code, d = http(port, 'POST', '/capture', {'capture_state': 'zzz'}, PET)
+    _, h = health()
+    check('/capture 非法形状 → 400 且不污染', code == 400 and h.get('capture_state') == 'slow',
+          repr((code, (d or {}).get('error'), h.get('capture_state'))))
+
+    code, d = http(port, 'POST', '/capture', cap_body,
+                   {'Authorization': 'Bearer wrong-token'})
+    check('/capture 凭据不对 → 401', code == 401, repr(code))
+
+    led = rows(os.path.join(data, 'ledger.jsonl'))
+    check('/capture 在账本留痕',
+          any(r.get('kind') == 'capture_report' for r in led),
+          repr([r.get('kind') for r in led][-4:]))
+
+    # ── 18. notes 行口径：native 录屏 frames=0 是正常的，靠 mode 区分（不是漏字段）
+    S.write_note('测试句', {'window': 'w-clip', 'frame_count': 0, 'mode': 'native'}, 'go', 7)
+    last = rows(os.path.join(data, 'notes.jsonl'))[-1]
+    check('clip(native) 行带 mode 且 frames=0',
+          last.get('mode') == 'native' and last.get('frames') == 0,
+          repr({k: last.get(k) for k in ('mode', 'frames', 'kind')}))
+
     bad = [n for n, ok in RESULTS if not ok]
     print('\n%d/%d 通过' % (len(RESULTS) - len(bad), len(RESULTS)))
     shutil.rmtree(data, ignore_errors=True)
     shutil.rmtree(toks, ignore_errors=True)
     if control:
         if not bad:
-            print('❌ 阳性对照失败：旧实现也全绿，说明断言测不出分区')
+            print('[FAIL] 阳性对照失败：旧实现也全绿，说明断言测不出分区')
             return 1
-        print('✅ 阳性对照成立：旧实现在 %d 条上红' % len(bad))
+        print('[OK] 阳性对照成立：旧实现在 %d 条上红' % len(bad))
         return 0
     return 0 if not bad else 1
 

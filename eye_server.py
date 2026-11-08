@@ -102,6 +102,9 @@ STATE = {
     'note_hist': [],          # [(ts, window)] 近期已写笔记（节流 + 去重用）
     'pool_ok_streak': 0,      # P5 池探测连击
     'pool_probe': None,       # {'ts', 'ok', 'detail'}
+    # 捕获端自报状态（2026-11-08）：{'state','idle_s','static_skips','last_static_age_s','ts'}
+    # 没有它，服务端只能看到"没东西"，分不清「没人用电脑 / 画面没动 / 眼睛瞎了」
+    'capture': None,
 }
 LOCK = threading.Lock()
 
@@ -118,6 +121,124 @@ for _s in ('mc', 'stardew'):
 del _s
 
 
+CAPTURE_STATES = ('normal', 'slow', 'paused')
+
+
+def _cap_int(meta, key, lo, hi):
+    """宽松取整数：非整数/缺省一律 None（宁可不报，也不写一个假状态）。"""
+    try:
+        v = int(meta.get(key))
+    except (TypeError, ValueError):
+        return None
+    return max(lo, min(hi, v))
+
+
+def capture_report(meta, now=None):
+    """把 /frames 里的捕获端自报字段解析成可展示状态；形状不对就整条丢弃。
+
+    这是**展示用**状态，不参与任何闸判定——客户端送什么都不改变限流/暂停/额度。
+    """
+    state = str(meta.get('capture_state') or '').strip().lower()
+    if state not in CAPTURE_STATES:
+        return None
+    idle = _cap_int(meta, 'capture_idle_s', 0, 7 * 86400)
+    skips = _cap_int(meta, 'capture_static_skips', 0, 100000)
+    sage = _cap_int(meta, 'capture_last_static_age_s', -1, 7 * 86400)
+    if idle is None or skips is None or sage is None:
+        return None
+    return {'state': state, 'idle_s': idle, 'static_skips': skips,
+            'last_static_age_s': sage, 'ts': time.time() if now is None else now}
+
+
+def capture_view():
+    """/health 用：平铺 + 一个 age，方便一眼看出"这条状态是不是陈的"。"""
+    cap = STATE.get('capture')
+    if not cap:
+        return {'capture_state': None, 'capture_idle_s': None,
+                'capture_static_skips': None, 'capture_last_static_age_s': None,
+                'capture_age_s': None}
+    return {'capture_state': cap['state'], 'capture_idle_s': cap['idle_s'],
+            'capture_static_skips': cap['static_skips'],
+            'capture_last_static_age_s': cap['last_static_age_s'],
+            'capture_age_s': max(0, int(time.time() - cap['ts']))}
+
+
+# ── 派生标量：服务端看得见"她多久没看见东西了"（2026-11-08，只读，不改任何行为） ──
+# 契约：code/wait/CONTRACT-eye-mount.md §3。last_note_age_s **永远是 int**——
+# 当天没有笔记时 = 距当天 00:00 的秒数。返回 null 会让 `last_note_age_s < 60` 变成 type_error，
+# 于是她的等待条件在"真正满足"时安静走到 timeout（与 MC 侧 day>=1 拿到 missing 同一个坑）。
+ROTATED_NOTES_RE = re.compile(r'^notes-\d{8}-\d{4}\.jsonl$')
+_NOTES_STATS_CACHE = {}
+
+
+def _cst_date(ts):
+    return time.strftime('%Y-%m-%d', time.gmtime(ts + 8 * 3600))
+
+
+def _since_midnight(ts):
+    """距北京时间当天 00:00 的秒数（CST 无夏令时，直接用偏移算，不依赖 tz 库）。"""
+    st = time.gmtime(ts + 8 * 3600)
+    return st.tm_hour * 3600 + st.tm_min * 60 + st.tm_sec
+
+
+def _notes_files(scene):
+    files = [scene_notes_file(scene)]
+    if scene == 'pet':
+        # pet 的 notes 会轮转（>3MB 改名 notes-YYYYMMDD-HHMM.jsonl），当天的行可能已经滚走了
+        try:
+            files += sorted(p for p in DATA_DIR.glob('notes-*.jsonl') if ROTATED_NOTES_RE.match(p.name))
+        except OSError:
+            pass
+    return files
+
+
+def notes_stats(scene='pet', now=None):
+    """(最后一行的 ts, 当天行数, 最近 1 小时行数)。按 (mtime,size) 缓存，不每次全量解析。"""
+    nowts = time.time() if now is None else now
+    files = [f for f in _notes_files(scene) if f.exists()]
+    sig = tuple((str(f), f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+    key = (scene, _cst_date(nowts), sig)
+    hit = _NOTES_STATS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    last_ts, today, hour = None, 0, 0
+    today_str = _cst_date(nowts)
+    for f in files:
+        try:
+            with open(f, encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ts = json.loads(line).get('ts')
+                    except Exception:
+                        continue
+                    if not isinstance(ts, (int, float)):
+                        continue
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+                    if _cst_date(ts) == today_str:
+                        today += 1
+                        if nowts - ts <= 3600:
+                            hour += 1
+        except OSError:
+            continue
+    out = (last_ts, today, hour)
+    _NOTES_STATS_CACHE.clear()          # 只留最新一次，防缓存无界
+    _NOTES_STATS_CACHE[key] = out
+    return out
+
+
+def note_age_s(scene='pet', now=None):
+    """距最近一条笔记的秒数；当天没有笔记 = 距当天 00:00 的秒数（永远是 int）。"""
+    nowts = time.time() if now is None else now
+    last_ts, _, _ = notes_stats(scene, nowts)
+    if last_ts is None or _cst_date(last_ts) != _cst_date(nowts):
+        return int(_since_midnight(nowts))
+    return max(0, int(nowts - last_ts))
+
+
 def scene_summary():
     """给 /health 用：每场景一行，含"是否启用"（= token 文件在不在）。"""
     out = {}
@@ -128,7 +249,11 @@ def scene_summary():
                   'day_bytes': st['day_bytes'], 'day_calls': st['day_calls'],
                   'day_tokens': st['day_tokens'],
                   'day_call_cap': SCENE_DAY_CALLS.get(s),
-                  'min_interval_s': SCENE_MIN_INTERVAL.get(s)}
+                  'min_interval_s': SCENE_MIN_INTERVAL.get(s),
+                  # 只读派生标量（/wait 的 path 集就从这里来）：看不见"多久没说话"= 无法区分
+                  # "没人用电脑"和"眼睛瞎了"
+                  'last_note_age_s': note_age_s(s),
+                  'notes_today': notes_stats(s)[1]}
     return out
 # 日计数落盘：eye-server 重启不该把当日 clip/日闸计数清零（否则"闸耗尽"状态会撒谎）
 DAY_STATE_FILE = DATA_DIR / 'day-state.json'
@@ -418,7 +543,9 @@ def write_note(note, meta, lane, tokens):
         pass
     row = {'ts': time.time(), 'note': note, 'window': meta.get('window', ''),
            'proc': meta.get('process', ''), 'lane': lane, 'tokens': tokens,
-           'frames': meta.get('frame_count', 0),
+           'frames': meta.get('frame_count') or 0,
+           # native=整段落视频（frames 恒 0 是正常的，不是漏字段）；keyframes=抽 6 帧
+           'mode': meta.get('mode', ''),
            # 结构化字段（issue #20）：消费端不用猜来源/是否沉默；只增不改，老消费者忽略即可
            'kind': 'clip' if meta.get('seconds') else 'frames',
            'skip': False,
@@ -443,6 +570,21 @@ def seed_note_hist():
         STATE['note_hist'] = [x for x in STATE['note_hist'] if x[0] > cutoff][-30:]
     except Exception:
         pass
+
+
+def win_key(meta):
+    """笔记归组键（governor / dup 用）：窗口名优先，取不到退到进程名。
+
+    2026-11-08：窗口名为空时（锁屏、无前台窗、UWP 拿不到标题）以前一律落成 ''，
+    于是**互不相关的两次观察共用同一个桶**——6 分钟内第 3 条起被 GOVERNOR 劝沉默，
+    还可能被 dup 判成复读直接吞掉。用进程名当兜底键，两者都没有（''）时调用方
+    按"不归组"处理：不加节流提示、不做去重，宁可多说一句也不误伤。"""
+    w = str(meta.get('window') or '').strip()
+    if w:
+        return w
+    # 注意字段名：调用方送的是 process（notes 行里落成 proc），两个都认
+    p = str(meta.get('process') or meta.get('proc') or '').strip()
+    return ('proc:' + p) if p else ''
 
 
 def same_window_count(window, now=None):
@@ -578,6 +720,10 @@ class H(BaseHTTPRequestHandler):
                                    'force_go': FORCE_GO_PATH.exists(),
                                    'pool_probe': STATE['pool_probe'],
                                    'pool_ok_streak': STATE['pool_ok_streak'],
+                                   'last_note_age_s': note_age_s('pet'),
+                                   'notes_today': notes_stats('pet')[1],
+                                   'notes_last_hour': notes_stats('pet')[2],
+                                   **capture_view(),
                                    'scenes': scene_summary()})
         if path == '/notes':
             try:
@@ -611,6 +757,30 @@ class H(BaseHTTPRequestHandler):
                 return self._json({'ok': False, 'error': 'scene-disabled', 'scene': scene}, 401)
             return self._json({'ok': False, 'error': 'unauthorized', 'scene': scene}, 401)
         path = self.path.split('?')[0]
+        if path == '/capture':
+            # 捕获端状态回传（2026-11-08）：**只报状态，不调模型、不扣额度、不受暂停闸影响**。
+            # 必须能穿透暂停：paused 恰恰是"永远不推 /frames"的那个状态，夹带在帧里永远学不到。
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+            except ValueError:
+                return self._json({'ok': False, 'error': 'bad-length'}, 400)
+            if length <= 0 or length > 8192:
+                return self._json({'ok': False, 'error': 'bad-length'}, 400)
+            try:
+                payload = json.loads(self.rfile.read(length).decode('utf-8'))
+            except Exception as e:
+                return self._json({'ok': False, 'error': 'bad-json: %s' % e}, 400)
+            meta = payload.get('meta') if isinstance(payload.get('meta'), dict) else payload
+            cap = capture_report(meta or {})
+            if not cap:
+                return self._json({'ok': False, 'error': 'bad-capture', 'need':
+                                   ['capture_state(normal|slow|paused)', 'capture_idle_s(int)',
+                                    'capture_static_skips(int)', 'capture_last_static_age_s(int)']}, 400)
+            with LOCK:
+                STATE['capture'] = cap
+            ledger('capture_report', state=cap['state'], idle_s=cap['idle_s'],
+                   static_skips=cap['static_skips'])
+            return self._json({'ok': True, 'capture': capture_view()})
         if path in ('/pause', '/resume'):
             q = self.path.split('scene=')[1].split('&')[0].lower() if 'scene=' in self.path else scene
             if q not in SCENES:
@@ -713,6 +883,7 @@ class H(BaseHTTPRequestHandler):
                     pass
             with LOCK:
                 STATE['day_tokens'] += tokens
+            meta['mode'] = mode                    # 落进 notes 行：native 的 frames=0 才不会被当漏字段
             note, skipped, had_marker = clean_note(note)
             # 三形态：尾挂=沉默 / 中置残留=剥离后照写 / 空=沉默（issue #20 口径）
             if not skipped:
@@ -720,7 +891,8 @@ class H(BaseHTTPRequestHandler):
                     STATE['note_hist'].append((time.time(), meta.get('window', ''), note))
                     STATE['note_hist'] = STATE['note_hist'][-30:]
                 write_note(note, meta, lane, tokens)
-                ledger('clip', tokens=tokens, lane=lane, mode=mode, bytes=len(data))
+                ledger('clip', tokens=tokens, lane=lane, mode=mode, bytes=len(data),
+                       frames=meta.get('frame_count') or 0)
                 return self._json({'ok': True, 'note': note, 'lane': lane, 'mode': mode,
                                    'tokens': tokens})
             ledger('clip_skip', lane=lane, tokens=tokens, mode=mode,
@@ -792,11 +964,16 @@ class H(BaseHTTPRequestHandler):
         if not frames or not isinstance(frames, list):
             return self._json({'error': 'no-frames'}, 400)
         meta = payload.get('meta', {})
+        cap = capture_report(meta)
+        if cap:
+            with LOCK:
+                STATE['capture'] = cap
+        wkey = win_key(meta)                  # 空窗口退到进程名，别把不相关的观察并成一个桶
         app_type = (meta.get('app_type') or 'other').lower()
         prompt = {'game': PROMPT_PLAY, 'video': PROMPT_VIDEO}.get(app_type, PROMPT_COMPANION)
         # P1 节流：同窗口 6 分钟内已说 ≥3 条 → 追加节流提示，推着模型选 [SKIP]
         with LOCK:
-            governed = same_window_count(meta.get('window', '')) >= GOV_MAX_NOTES
+            governed = bool(wkey) and same_window_count(wkey) >= GOV_MAX_NOTES
         meta['prompt_tail'] = prompt + (GOVERNOR if governed else '')
         meta['governed'] = governed
         meta['frame_count'] = len(frames)
@@ -815,7 +992,7 @@ class H(BaseHTTPRequestHandler):
         if note and not note_skipped:
             # P4 去重：同窗口最近几条相似度 >0.72 → 视为复读，不写不推
             with LOCK:
-                dup = recent_similar(meta.get('window', ''), note)
+                dup = recent_similar(wkey, note) if wkey else None
             if dup is not None:
                 with LOCK:
                     ledger('dup_note', lane=lane, tokens=tokens,
@@ -823,7 +1000,7 @@ class H(BaseHTTPRequestHandler):
                 return self._json({'ok': True, 'note': '', 'skipped': True, 'dup': True,
                                    'lane': lane, 'tokens': tokens})
             with LOCK:
-                STATE['note_hist'].append((time.time(), meta.get('window', ''), note))
+                STATE['note_hist'].append((time.time(), wkey, note))
                 STATE['note_hist'] = STATE['note_hist'][-30:]
             write_note(note, meta, lane, tokens)
             ledger('note', tokens=tokens, lane=lane, governed=governed)
