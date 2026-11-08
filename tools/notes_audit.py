@@ -55,27 +55,40 @@ def local(ts):
     return datetime.datetime.fromtimestamp(ts)
 
 
+def parse_cut(c, end_ts):
+    """切点解析：'HH:MM' 或 'YYYY-MM-DD HH:MM'。
+
+    HH:MM 取"不晚于最后一行的最近一次出现"——因为 24h 窗口常常跨日，若按"时分"直接比大小，
+    昨晚 21:04 之后的行会被错切进今天的最后一段（2026-11-08 实际踩过：段 4 从 4 行变 45 行）。
+    """
+    c = c.strip()
+    end = local(end_ts)
+    if ' ' in c:
+        return datetime.datetime.strptime(c, '%Y-%m-%d %H:%M').timestamp()
+    h, m = c.split(':')
+    dt = end.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+    if dt.timestamp() > end_ts:
+        dt -= datetime.timedelta(days=1)
+    return dt.timestamp()
+
+
 def split_by(rows, cuts):
-    """按本地时刻 'HH:MM' 切段；返回 [(label, rows)]。切点即段起点。"""
+    """按切点（时间戳）切段；返回 [(label, rows)]。切点即段起点。"""
+    if not rows:
+        return [('全部', rows)]
     if not cuts:
         return [('全部', rows)]
-    def key_of(r):
-        t = local(r['ts'])
-        return t.hour * 60 + t.minute
-    points = []
-    for c in cuts:
-        h, m = c.split(':')
-        points.append(int(h) * 60 + int(m))
-    points.sort()
-    buckets = collections.OrderedDict()
-    labels = ['..%s' % cuts[0]] + ['%s..%s' % (cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)] + ['%s..' % cuts[-1]]
-    for lab in labels:
-        buckets[lab] = []
+    pts = sorted(parse_cut(c, rows[-1]['ts']) for c in cuts)
+    labels = ['..%s' % local(pts[0]).strftime('%m-%d %H:%M')]
+    for i in range(len(pts) - 1):
+        labels.append('%s..%s' % (local(pts[i]).strftime('%m-%d %H:%M'),
+                                  local(pts[i + 1]).strftime('%m-%d %H:%M')))
+    labels.append('%s..' % local(pts[-1]).strftime('%m-%d %H:%M'))
+    buckets = collections.OrderedDict((lab, []) for lab in labels)
     for r in rows:
-        k = key_of(r)
         idx = 0
-        for i, pt in enumerate(points):
-            if k >= pt:
+        for i, pt in enumerate(pts):
+            if r['ts'] >= pt:
                 idx = i + 1
         buckets[labels[idx]].append(r)
     return list(buckets.items())
@@ -167,6 +180,20 @@ def selftest():
     assert (n, involved) == (1, 2), (n, involved)
     assert sum(r.get('tokens') or 0 for r in got) == 830
 
+    # --hours 的过滤以"最后一行 ts"为终点（不是 now()，否则跑历史文件会全空）
+    now = got[-1]['ts']
+    keep_all = [r for r in got if r['ts'] >= now - 600]        # 10 分钟窗口：5 行全在
+    assert len(keep_all) == len(got), (len(keep_all), len(got))
+    win = [r for r in got if r['ts'] >= now - 90]              # 90 秒窗口：只剩 +240s 与 +300s
+    assert len(win) == 2, len(win)
+
+    # 跨日切分：昨晚 22:00 的行必须留在第一段，不许被 'HH:MM' 错切进最后一段
+    y0 = datetime.datetime(2026, 11, 7, 22, 0, 0).timestamp()
+    two_day = [dict(rows[0], ts=y0), dict(rows[0], ts=t0 + 60)]
+    cut_seg = split_by(two_day, ['12:00'])   # 切在今天 12:00：昨晚 22:00 落在第一段
+    assert [len(b) for _, b in cut_seg] == [1, 1], [(a, len(b)) for a, b in cut_seg]
+    assert local(cut_seg[0][1][0]['ts']).day == 7, '昨晚的行被切到了今天的段里'
+
     seg = split_by(got, ['12:03'])
     # t0=12:00 → +60s=12:01、+120s=12:02 在切点前；+180/240/300 在切点后
     assert [len(b) for _, b in seg] == [2, 3], [(a, len(b)) for a, b in seg]
@@ -178,7 +205,7 @@ def selftest():
     got2 = load_rows([p])
     res = audit('自检', got2)
     assert res['leaks'] == 1 and any('SKIP' in b for b in res['bad']), res
-    print('\n[OK] selftest 通过：行数/缺 mode/空 window/近重复/token 合计/切段/泄漏检测 全对')
+    print('\n[OK] selftest 通过：行数/缺 mode/空 window/近重复/token 合计/切段/泄漏检测 全对：含 --hours 窗口过滤')
     return 0
 
 
@@ -187,6 +214,10 @@ def main(argv=None):
     ap.add_argument('files', nargs='*', help='notes jsonl（可多个）')
     ap.add_argument('--split', default='', help='按本地时刻切段，如 12:41,13:57')
     ap.add_argument('--date', default='', help='只保留这一天（本地时区 YYYY-MM-DD）')
+    ap.add_argument('--gaps', type=int, default=0,
+                    help='报告超过 N 秒的静默空档（用来核对"没说话"是否都有捕获端 idle 解释）')
+    ap.add_argument('--hours', type=float, default=0,
+                    help='只要最近 N 小时（以最后一行 ts 为终点；24 = 契约 §6 的 24h 窗口）')
     ap.add_argument('--selftest', action='store_true')
     a = ap.parse_args(argv)
 
@@ -196,6 +227,9 @@ def main(argv=None):
         ap.error('至少给一个 notes 文件（或用 --selftest）')
 
     rows = load_rows(a.files)
+    if a.hours and rows:
+        end = rows[-1]['ts']
+        rows = [r for r in rows if r['ts'] >= end - a.hours * 3600]
     if a.date:
         rows = [r for r in rows if local(r['ts']).strftime('%Y-%m-%d') == a.date]
     if not rows:
@@ -204,12 +238,27 @@ def main(argv=None):
     span = '%s → %s' % (local(rows[0]['ts']).strftime('%Y-%m-%d %H:%M:%S'),
                         local(rows[-1]['ts']).strftime('%Y-%m-%d %H:%M:%S'))
     print('文件：%s' % ', '.join(a.files))
-    print('时间跨度（本地时区）：%s，共 %d 行' % (span, len(rows)))
+    print('时间跨度（本地时区）：%s，共 %d 行%s' % (
+        span, len(rows), ('（--hours %g 已过滤）' % a.hours) if a.hours else ''))
 
     cuts = [c for c in a.split.split(',') if c.strip()]
     results = []
     for label, seg in split_by(rows, cuts):
         results.append((label, audit(label, seg)))
+
+    if a.gaps:
+        print('\n--- 静默空档 >%ds（每段都要能对上捕获端 idle/pause；对不上才是真事故）---' % a.gaps)
+        gaps = []
+        for i, r in enumerate(rows):
+            prev = rows[i - 1]['ts'] if i else None
+            if prev is not None and r['ts'] - prev > a.gaps:
+                gaps.append((prev, r['ts'], r['ts'] - prev))
+        if not gaps:
+            print('  无（≥%ds 的空档一个都没有）' % a.gaps)
+        for a_ts, b_ts, dt in gaps:
+            print('  %s → %s  %d 分 %02ds' % (local(a_ts).strftime('%m-%d %H:%M:%S'),
+                                             local(b_ts).strftime('%m-%d %H:%M:%S'), dt // 60, dt % 60))
+        print('  合计 %d 段，静默总时长 %d 分钟' % (len(gaps), sum(g[2] for g in gaps) // 60))
 
     bad = [(lab, b) for lab, r in results for b in (r.get('bad') or [])]
     print('\n--- 汇总 ---')
