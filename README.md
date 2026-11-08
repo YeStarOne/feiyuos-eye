@@ -32,6 +32,8 @@ python tools/notes_audit.py --selftest                 # 对账工具自检（�
 python tools/notes_audit.py ~/pc-body/notes.jsonl --date 2026-11-08 --split 12:48,19:41
 ```
 
+首份 24h 对账报告：[docs/2026-11-08-notes-24h-reconcile.md](docs/2026-11-08-notes-24h-reconcile.md)。
+
 `notes_audit.py` 是 24h 金标准对账的**可重复口径**：分母先行（每段先报 n），
 再给 kind/lane/帧数/token/SKIP 泄漏/空 window/近重复；硬不变量破了才 exit 1。
 ⚠️ 它**不做门槛判定**，只报计数——门槛在 `frames-contract.md` §6。
