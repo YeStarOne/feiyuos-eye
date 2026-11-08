@@ -418,7 +418,9 @@ def write_note(note, meta, lane, tokens):
         pass
     row = {'ts': time.time(), 'note': note, 'window': meta.get('window', ''),
            'proc': meta.get('process', ''), 'lane': lane, 'tokens': tokens,
-           'frames': meta.get('frame_count', 0),
+           'frames': meta.get('frame_count') or 0,
+           # native=整段落视频（frames 恒 0 是正常的，不是漏字段）；keyframes=抽 6 帧
+           'mode': meta.get('mode', ''),
            # 结构化字段（issue #20）：消费端不用猜来源/是否沉默；只增不改，老消费者忽略即可
            'kind': 'clip' if meta.get('seconds') else 'frames',
            'skip': False,
@@ -443,6 +445,21 @@ def seed_note_hist():
         STATE['note_hist'] = [x for x in STATE['note_hist'] if x[0] > cutoff][-30:]
     except Exception:
         pass
+
+
+def win_key(meta):
+    """笔记归组键（governor / dup 用）：窗口名优先，取不到退到进程名。
+
+    2026-11-08：窗口名为空时（锁屏、无前台窗、UWP 拿不到标题）以前一律落成 ''，
+    于是**互不相关的两次观察共用同一个桶**——6 分钟内第 3 条起被 GOVERNOR 劝沉默，
+    还可能被 dup 判成复读直接吞掉。用进程名当兜底键，两者都没有（''）时调用方
+    按"不归组"处理：不加节流提示、不做去重，宁可多说一句也不误伤。"""
+    w = str(meta.get('window') or '').strip()
+    if w:
+        return w
+    # 注意字段名：调用方送的是 process（notes 行里落成 proc），两个都认
+    p = str(meta.get('process') or meta.get('proc') or '').strip()
+    return ('proc:' + p) if p else ''
 
 
 def same_window_count(window, now=None):
@@ -713,6 +730,7 @@ class H(BaseHTTPRequestHandler):
                     pass
             with LOCK:
                 STATE['day_tokens'] += tokens
+            meta['mode'] = mode                    # 落进 notes 行：native 的 frames=0 才不会被当漏字段
             note, skipped, had_marker = clean_note(note)
             # 三形态：尾挂=沉默 / 中置残留=剥离后照写 / 空=沉默（issue #20 口径）
             if not skipped:
@@ -720,7 +738,8 @@ class H(BaseHTTPRequestHandler):
                     STATE['note_hist'].append((time.time(), meta.get('window', ''), note))
                     STATE['note_hist'] = STATE['note_hist'][-30:]
                 write_note(note, meta, lane, tokens)
-                ledger('clip', tokens=tokens, lane=lane, mode=mode, bytes=len(data))
+                ledger('clip', tokens=tokens, lane=lane, mode=mode, bytes=len(data),
+                       frames=meta.get('frame_count') or 0)
                 return self._json({'ok': True, 'note': note, 'lane': lane, 'mode': mode,
                                    'tokens': tokens})
             ledger('clip_skip', lane=lane, tokens=tokens, mode=mode,
@@ -792,11 +811,12 @@ class H(BaseHTTPRequestHandler):
         if not frames or not isinstance(frames, list):
             return self._json({'error': 'no-frames'}, 400)
         meta = payload.get('meta', {})
+        wkey = win_key(meta)                  # 空窗口退到进程名，别把不相关的观察并成一个桶
         app_type = (meta.get('app_type') or 'other').lower()
         prompt = {'game': PROMPT_PLAY, 'video': PROMPT_VIDEO}.get(app_type, PROMPT_COMPANION)
         # P1 节流：同窗口 6 分钟内已说 ≥3 条 → 追加节流提示，推着模型选 [SKIP]
         with LOCK:
-            governed = same_window_count(meta.get('window', '')) >= GOV_MAX_NOTES
+            governed = bool(wkey) and same_window_count(wkey) >= GOV_MAX_NOTES
         meta['prompt_tail'] = prompt + (GOVERNOR if governed else '')
         meta['governed'] = governed
         meta['frame_count'] = len(frames)
@@ -815,7 +835,7 @@ class H(BaseHTTPRequestHandler):
         if note and not note_skipped:
             # P4 去重：同窗口最近几条相似度 >0.72 → 视为复读，不写不推
             with LOCK:
-                dup = recent_similar(meta.get('window', ''), note)
+                dup = recent_similar(wkey, note) if wkey else None
             if dup is not None:
                 with LOCK:
                     ledger('dup_note', lane=lane, tokens=tokens,
@@ -823,7 +843,7 @@ class H(BaseHTTPRequestHandler):
                 return self._json({'ok': True, 'note': '', 'skipped': True, 'dup': True,
                                    'lane': lane, 'tokens': tokens})
             with LOCK:
-                STATE['note_hist'].append((time.time(), meta.get('window', ''), note))
+                STATE['note_hist'].append((time.time(), wkey, note))
                 STATE['note_hist'] = STATE['note_hist'][-30:]
             write_note(note, meta, lane, tokens)
             ledger('note', tokens=tokens, lane=lane, governed=governed)

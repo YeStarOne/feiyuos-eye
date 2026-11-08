@@ -277,15 +277,53 @@ def main():
     check('ledger: pet 行没有 scene',
           bool(pet_rows) and all('scene' not in r for r in pet_rows), repr(pet_rows[:1]))
 
+    # ── 17. 空 window 不共用「同一个桶」（governor 误劝沉默 / dup 误吞）
+    #  2026-11-08：锁屏/无前台窗/UWP 拿不到标题时 window=''，以前所有这类观察并进同一个桶，
+    #  6 分钟内第 3 条起被劝沉默、相似句还会被判复读。归组键=「窗口名优先，进程名兜底」。
+    wk = getattr(S, 'win_key', None)
+    check('win_key: 有窗口名用窗口名',
+          bool(wk) and wk({'window': '标题A', 'proc': 'a.exe'}) == '标题A', repr(wk and wk({'window': '标题A', 'proc': 'a.exe'})))
+    check('win_key: 空窗口退到进程名',
+          bool(wk) and wk({'window': '  ', 'proc': 'a.exe'}) == 'proc:a.exe', repr(wk and wk({'window': '  ', 'proc': 'a.exe'})))
+    check('win_key: 不同进程不并桶',
+          bool(wk) and wk({'window': '', 'proc': 'a.exe'}) != wk({'window': '', 'proc': 'b.exe'}))
+    check('win_key: 全空返回空串（调用方跳过桶）',
+          bool(wk) and wk({'window': '', 'proc': ''}) == '', repr(wk and wk({'window': '', 'proc': ''})))
+
+    if hasattr(S, 'STATE') and hasattr(S, 'recent_similar'):
+        S.STATE.setdefault('note_hist', []).append(
+            (__import__('time').time(), 'proc:a.exe', '同一句很长很长很长的观察描述内容'))
+        check('同进程的空窗口笔记照常判复读',
+              S.recent_similar('proc:a.exe', '同一句很长很长很长的观察描述内容') is not None)
+        check('不同进程的空窗口笔记不判复读',
+              S.recent_similar('proc:b.exe', '同一句很长很长很长的观察描述内容') is None)
+        # 接线（只测 helper 会假绿）：真 POST 一条空窗口+process 的请求，note_hist 必须记进程键
+        code, d = http(port, 'POST', '/frames',
+                       {'frames': FR, 'meta': {'app_type': 'game', 'window': '',
+                                              'process': 'zz.exe'}}, PET)
+        k = S.STATE['note_hist'][-1][1] if S.STATE.get('note_hist') else None
+        check('空窗口 POST 的 note_hist 记进程键（接线）', code == 200 and k == 'proc:zz.exe',
+              repr((code, k)))
+    else:
+        check('note_hist 可测（recent_similar/STATE 必须存在，不许静默跳过）', False,
+              'recent_similar=%s STATE=%s' % (hasattr(S, 'recent_similar'), hasattr(S, 'STATE')))
+
+    # ── 18. notes 行口径：native 录屏 frames=0 是正常的，靠 mode 区分（不是漏字段）
+    S.write_note('测试句', {'window': 'w-clip', 'frame_count': 0, 'mode': 'native'}, 'go', 7)
+    last = rows(os.path.join(data, 'notes.jsonl'))[-1]
+    check('clip(native) 行带 mode 且 frames=0',
+          last.get('mode') == 'native' and last.get('frames') == 0,
+          repr({k: last.get(k) for k in ('mode', 'frames', 'kind')}))
+
     bad = [n for n, ok in RESULTS if not ok]
     print('\n%d/%d 通过' % (len(RESULTS) - len(bad), len(RESULTS)))
     shutil.rmtree(data, ignore_errors=True)
     shutil.rmtree(toks, ignore_errors=True)
     if control:
         if not bad:
-            print('❌ 阳性对照失败：旧实现也全绿，说明断言测不出分区')
+            print('[FAIL] 阳性对照失败：旧实现也全绿，说明断言测不出分区')
             return 1
-        print('✅ 阳性对照成立：旧实现在 %d 条上红' % len(bad))
+        print('[OK] 阳性对照成立：旧实现在 %d 条上红' % len(bad))
         return 0
     return 0 if not bad else 1
 
