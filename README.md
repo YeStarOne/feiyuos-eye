@@ -27,7 +27,7 @@
 ## 自测
 
 ```bash
-python selftest_scene.py     # 40/40 场景用例 + 阳性对照（改坏必转红）
+python selftest_scene.py     # 场景用例 + 阳性对照（改坏必转红）
 python tools/notes_audit.py --selftest                 # 对账工具自检（合成数据，已知答案）
 python tools/notes_audit.py ~/pc-body/notes.jsonl --date 2026-11-08 --split 12:48,19:41
 ```
