@@ -35,8 +35,8 @@ python selftest_scene.py     # 32/32 场景用例 + 阳性对照（改坏必转�
 | 身体 | 捕获 | 仓库 |
 | --- | --- | --- |
 | 桌宠 | PrintWindow（pc_body /clip） | [feiyu-os code/pc](https://github.com/YeStarOne/feiyu-os) |
-| Minecraft | prismarine-viewer 无头渲染 | [feiyu-minecraft](https://github.com/YeStarOne/feiyu-minecraft) |
-| 星露谷 | pc_body /clip 窗口帧 | [stardew-ai-farmer](https://github.com/YeStarOne/stardew-ai-farmer) |
+| Minecraft | prismarine-viewer 无头渲染 | [feiyuos-minecraft](https://github.com/YeStarOne/feiyuos-minecraft) |
+| 星露谷 | pc_body /clip 窗口帧 | [feiyuos-stardew-ai-farmer](https://github.com/YeStarOne/feiyuos-stardew-ai-farmer) |
 
 ## 红线
 
