@@ -27,7 +27,12 @@
 ## 自测
 
 ```bash
-python selftest_scene.py     # 32/32 场景用例 + 阳性对照（改坏必转红）
+python selftest_scene.py     # 场景用例 + 阳性对照（改坏必转红）
+
+# 记忆回写第一切片：当天笔记 → 主题卡 / 未了结线索（确定性，不调模型、不写记忆库）
+python tools/memory_writeback.py --selftest          # 合成数据，已知答案
+python tools/memory_writeback.py --mutation-check    # 阳性对照：4 个变异体必须各自打红
+python tools/memory_writeback.py ~/pc-body/notes.jsonl --date 2026-11-08
 ```
 
 ## 消费方
