@@ -27,8 +27,14 @@
 ## 自测
 
 ```bash
-python selftest_scene.py     # 32/32 场景用例 + 阳性对照（改坏必转红）
+python selftest_scene.py     # 40/40 场景用例 + 阳性对照（改坏必转红）
+python tools/notes_audit.py --selftest                 # 对账工具自检（合成数据，已知答案）
+python tools/notes_audit.py ~/pc-body/notes.jsonl --date 2026-11-08 --split 12:48,19:41
 ```
+
+`notes_audit.py` 是 24h 金标准对账的**可重复口径**：分母先行（每段先报 n），
+再给 kind/lane/帧数/token/SKIP 泄漏/空 window/近重复；硬不变量破了才 exit 1。
+⚠️ 它**不做门槛判定**，只报计数——门槛在 `frames-contract.md` §6。
 
 ## 消费方
 
